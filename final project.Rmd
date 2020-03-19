@@ -1,0 +1,636 @@
+---
+title: "Horse Racing"
+author: "Abhishek Baral"
+date: "12/10/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readr)
+library(ggplot2)
+library(stringr)
+library(gridExtra)
+library(grid)
+library(lubridate)
+library(xtable)
+library(speedglm)
+library(caret)
+library(pROC)
+library(MASS)
+suppressMessages(library(rattle))
+library(randomForest)
+library(doParallel)
+library(lubridate)
+library(magrittr)
+library(patchwork)
+```
+
+```{r, include=FALSE, echo=FALSE}
+barrier <- read_csv("C:/Users/abhis/Documents/Duke University/IDS 702 Modeling and Representation of Data/horse-racing-dataset-for-experts-hong-kong/barrier.csv")
+horse_info <- read_csv("C:/Users/abhis/Documents/Duke University/IDS 702 Modeling and Representation of Data/horse-racing-dataset-for-experts-hong-kong/horse_info.csv")
+results <- read_csv("C:/Users/abhis/Documents/Duke University/IDS 702 Modeling and Representation of Data/horse-racing-dataset-for-experts-hong-kong/results.csv")
+
+barrier[,c(1,11,19:26)] = NULL
+results[,c(1,2,23:31)] = NULL
+horse_info[,c(1,5,6,9,10,13)] = NULL
+
+results = left_join(results, horse_info, by = "horse")
+results$jockey.y = NULL
+results$trainer.y = NULL
+
+### Seeing If Horse Changed Places ###
+results$pos_change = ifelse(as.integer(str_extract(results$runningpos, pattern = "^[0-9]")) > as.integer(str_extract(results$runningpos, pattern = "[0-9]$")),"Overtook",
+                            ifelse(as.integer(str_extract(results$runningpos, pattern = "^[0-9]")) < as.integer(str_extract(results$runningpos, pattern = "[0-9]$")), "Overtaken", "Steady"))
+
+### Converting MSS to seconds ###
+#results$finishtime = gsub(pattern = "\\.", ":", x = results$finishtime)
+
+### Top 3 Finishers ###
+results$plc_top3 = ifelse(results$plc == "1" | results$plc == "2" | results$plc == "3", 1, 0)
+
+### Removing Last 6 Characters From Name ###
+results$horse = sub(" *\\(.*", "", results$horse)
+
+```
+
+## Abstract
+
+## Intro  
+
+This paper was inspired by Bill Benter, who developed on of he most successful statistical softwares in predicting horse race winnings for the Hong Kong racing market, nearly raking in 1 billion dollars during his career in Honk Kong betting on horses. At the time, Bill's model used 16 variables that could affect the horses, jockeys, and trainers of a race that could have an impact on its outcome. Now is latest software analyzes over 130 different parameters, and takes into consideration of the prices of different bets to find the most optimal betting strategy. Allegedly, on average, he brought home between 5 to 10 million dollars in a single day at the race track during his hayday.  
+
+The purpose of this paper is to attempt to recreate an earlier version of Bill's model, in the hope of understanding how machine learning can be used in the area of sports betting. The paper will dive into a few machine learning methods in the hopes that a certain method will be able to predict winning horses better than chance.  
+
+## EDA/Analysis
+```{r, include=TRUE, echo=FALSE, warning=FALSE, message=FALSE, fig.align="center", fig.height= 4, fig.width=7}
+
+### Hadicap Weight ###
+# p1 = results %>%
+#   group_by(horseno) %>%
+#   summarise(
+#     avg_weight = mean(actualwt)
+#   ) %>%
+#   filter(complete.cases(.)) %>%
+#   ggplot(aes(x = horseno, y = avg_weight)) +z
+#   geom_bar(stat = "identity") +
+#   ggtitle("Final weight carried") +
+#   xlab("horse number") +
+#   ylab("average final weight") +
+#   scale_x_continuous(breaks = c(1:14))
+
+p1 = results %>%
+  mutate(winner = ifelse(str_detect(plc, "^1( .+)?$"), 1, 0)
+         ) %>%
+  group_by(horseno) %>%
+  summarise(
+    avg_weight = mean(actualwt, na.rm = T),
+    avg_declare_weight = round(mean(declarwt, na.rm = T),0),
+    avg_win = round(mean(winner, na.rm = T) * 100,2)
+  ) %>%
+  filter(complete.cases(.)) %>%
+  ggplot(aes(x = horseno, y = avg_weight)) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  ggtitle("Final weight carried") +
+  xlab("Horse number") +
+  ylab("Average final weight") +
+  scale_x_continuous(breaks = c(1:14)) +
+  geom_text(aes(label=avg_win, vjust= -0.5, hjust = 0.45)) +
+  coord_cartesian(ylim = c(1:150), expand = T)
+
+### Declared Weight ###
+p2 = ggplot(results, aes(x = declarwt)) +
+  geom_histogram(fill = "darkred") +
+  ggtitle("Distribution of weight") +
+  xlab("Declared horse weight") +
+  ylab(label = "Count")
+  
+p1/
+p2
+
+```
+
+In horse racing a handicap system is used where each horse is allocated a weight based on its ablility in an attempt to equlise every horses chances of winning. A better horse, indicated by horse number will carry more weight since the handicapper believes they are more likely to win the race.  Looking at the top graph, the handicapper has done somewhat of a decent job in attempting to equalize the odds of winning. On average, the most favored horse to win carries an addtional 131 pounds of extra weight and has an 11.04% chance of winning, while the least favored wears an additional 119 pounds with a 2.73% chance of winning. The handicapper should put even more weight on the number 1 horse while taking off weight for the number 14 horse to further equalize the playing field.  
+
+Moving to the lower graph, we see that the distribution of the horse weight is suprisingly normal, with a mean of 1108 pounds before the additional weight tacked on and a standard deviation of 62 pounds. This went against my person expectation, as I would have assumed that the disribution would be bimodal, where stronger/heavier horses would be used in shorter length races and lighter horses would be more common for longer length races. 
+
+```{r, echo=FALSE, include=TRUE, fig.align="center", fig.height= 4, fig.width=7}
+### Horse Draw ###
+results %>%
+  mutate(winner = ifelse(plc_top3 == 1, 1, 0)) %>% 
+  group_by(draw) %>%
+  summarise(
+    winning_prob = round(sum(winner)/n(),2) * 100
+    )  %>%
+  filter(complete.cases(.)) %>%
+  ggplot(aes(x = draw, y = winning_prob)) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  ggtitle("Winning probablity vs. draw") +
+  xlab("Draw") +
+  ylab("Winning probablility") +
+  scale_x_continuous(breaks = c(1:14)) +
+  coord_cartesian(ylim = c(1:35), expand = F) +
+  geom_text(aes(label=winning_prob), vjust = -0.5, hjust = .40)
+```
+
+The draw or gate number is drawn two days before the races. Gate number 1 is the inner most lane, so we would expect horses have have lower draws to have higher chances of winnings. We see that the first gate has the highest probability of winning with roughly a 30 percent chance on average. What is interesting is that there is there is no linear decrease as draw increases, for example, draw 5 has the fourth highest chance of winning and draw 13 is the worst draw rather than 14.  
+
+```{r, include=TRUE, echo=FALSE, warning=FALSE, message=FALSE, fig.align="center", fig.height= 4, fig.width=7}
+### Top Jockey ###
+p3 = results %>%
+  group_by(jockey) %>%
+  summarise(
+    horse_winrate = round(100 * sum(plc_top3)/n(),2),
+    wins = sum(plc_top3),
+    count = n()
+  ) %>% 
+  arrange(desc(wins)) %>%
+  head(10) %>%
+  ggplot(aes(x = reorder(jockey, -wins), y = wins)) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  ggtitle("Top 10 jockies") +
+  xlab("Jockey") +
+  ylab("Wins") +
+  coord_cartesian(ylim = c(1:525), expand = T) +
+  geom_text(aes(label= wins),hjust = -.05) 
+
+p3 = p3 + coord_flip()
+  
+### Top Horses ###
+p4 = results %>%
+  group_by(horse) %>%
+  summarise(
+    horse_winrate = round(100 * sum(plc_top3)/n(),2),
+    wins = sum(plc_top3),
+    count = n()
+  ) %>% 
+  arrange(desc(wins)) %>%
+  head(10) %>%
+  ggplot(aes(x = reorder(horse, -wins), y = wins)) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  ggtitle("Top 10 horses") +
+  xlab("Horse") +
+  ylab("Wins") +
+  coord_flip() +
+  geom_text(aes(label= wins),hjust = -.05) 
+
+grid.arrange(p3,p4, nrow = 2)
+
+```
+
+To see who the best horses and jockeys were, a count was made everytime the horse or jockey was placed in the top 3 of races. Lookin at the jockies, J Moreira is the clear winner with 481 top 3 wins to his name, and Molly's Jade Star barely is the top 3 winner with only 11 wins. The reason why there is such a large gap of wins between the horses and the jockies is that jockies ride multiple horses during a racing event, as they get paid every time they race. The average fee a jocky gets is between 50 to 100 dollars per race, which explains the huge gap. In fact, jockies are the worst paid athletes with an average salary of 50,000 dollars per year.   
+
+```{r, include=TRUE, echo=FALSE, warning=FALSE, message=FALSE, fig.align="center", fig.height= 4, fig.width=7}
+### Horse Parents ###
+x = results %>%
+  filter(is.na(sire) == F) %>%
+  group_by(sire) %>%
+  summarise(
+    wins = sum(plc_top3),
+    count = n(),
+    type = "sire"
+  ) %>%
+  arrange(desc(wins)) %>%
+  head(10)
+
+
+y = results %>%
+  filter(is.na(dam) == F) %>%
+  group_by(dam) %>%
+  summarise(
+    wins = sum(plc_top3),
+    count = n(),
+    type = "dam"
+  ) %>%
+  arrange(desc(wins)) %>%
+  head(10)
+
+colnames(x)[1] = "Name"
+colnames(y)[1] = "Name"
+
+z = rbind(x,y)
+  
+p5 = ggplot(x, aes(x = reorder(Name, -wins), y = wins)) +
+  geom_bar(stat = "identity", fill = "darkblue") +
+  xlab("Sire") +
+  ylab("Wins") +
+  coord_flip() +
+  geom_text(aes(label = wins, hjust = -.05)) 
+
+#p5 = p5 + coord_cartesian(ylim = c(20:80))  
+
+p6 = ggplot(y, aes(x =reorder(Name, -wins), y = wins)) +
+  geom_bar(stat = "identity", fill = "pink") +
+  xlab("Dam") +
+  ylab("Wins") +
+  coord_flip() +
+  geom_text(aes(label = wins), hjust = -.05) 
+
+#p6 = p6 + coord_cartesian(ylim = c(5:20)) 
+  
+
+### Country of origin ###
+p7 = results %>%
+  filter(is.na(country) != T) %>%
+  group_by(country) %>%
+  summarise(
+    country_win =  sum(plc_top3, na.rm = T),
+    count = n(),
+  ) %>%
+  arrange(desc(country_win)) %>%
+  head(10) %>%
+  ggplot(aes(x = reorder(country, -country_win), y = country_win)) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  ggtitle("Top 10 countries") +
+  xlab("country") +
+  ylab("number of wins") +
+  coord_cartesian(ylim = 1:1500) +
+  geom_text(aes(label= country_win), vjust = -0.5, hjust = .40) 
+
+(p5 | p6)
+  
+```
+
+Moving towards the orgin of the winning horses, looking at the graph, we can see that the country that produces the most winners is Australia. Interestingly, Australia exports their horses to most racing nations, especially those in the South-East area where half the horses in training come from Australia. 
+
+To see if biology had and effect, we took the winning horses and looked at their lineage. Looking at the left, we see that Exceed And Excel had children that racked up a total of 81 top 3 wins, and Starship had 16 top 3 wins. It makes sense that parents....
+
+
+```{r, echo=FALSE, include=FALSE}
+### Owner vs. wins, could be a table
+money = results %>%
+  group_by(owner) %>%
+  summarise(
+    owner_win =  sum(plc_top3, na.rm = TRUE),
+    count = n(),
+    avg_stake = mean(stake),
+  ) %>%
+  arrange(desc(owner_win)) %>%
+  head(10) 
+```
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{rlrrr}
+  \hline
+ & owner & owner\_win & count & avg\_stake \\ 
+  \hline
+1 &  & 27.00 & 105 & 1942619.05 \\ 
+  2 & Albert Hung Chao Hong & 16.00 &  29 & 2242931.03 \\ 
+  3 & The Hon Ronald Arculli GBM GBS JP \& Johanna K J Arculli BBS & 16.00 &  52 & 1183076.92 \\ 
+  4 & Chan Ming Wing & 15.00 &  44 & 965500.00 \\ 
+  5 & Edmond Siu Kim Ping & 15.00 &  58 & 1482672.41 \\ 
+  6 & Henry Cheng Kar Shun & 14.00 &  44 & 939250.00 \\ 
+  7 & Kwok Siu Ming & 14.00 &  49 & 2822693.88 \\ 
+  8 & Martin Siu Kim Sun & 14.00 &  41 & 1950243.90 \\ 
+  9 & David Hui Cheung Wing & 13.00 &  43 & 1302744.19 \\ 
+  10 & Marces Lee Tze Bun & 13.00 &  46 & 1514565.22 \\ 
+   \hline
+\end{tabular}
+\end{table}
+
+To see if wealthier owners had an infulence on horses winning, a comparision was made between the owner of the horse and the amount of wins that they won over the life time of the dataset. When putting a horse for a competiton, owners must put in a stake, which comprises part of the prize money, the idea is that the stake is a proxy to wealth. The average staked amount in the data set $1,310,264. We see that six out of the the top ten winners spent more than average, however there are far more instances of losers spending more than the average. Perhaps these top six are more effiecient with their spending compared to the rest of the contestants.  
+
+```{r, echo=FALSE, include=FALSE}
+### Top 10 Trainers ###
+results %>%
+  filter(is.na(trainer.x) != T) %>%
+  group_by(trainer.x) %>%
+  summarise(
+    trainer_win =  sum(plc_top3, na.rm = TRUE),
+    count = n(),
+  ) %>%
+  arrange(desc(trainer_win)) %>%
+  head(10) %>%
+  ggplot(aes(x = reorder(trainer.x, -trainer_win), y = trainer_win)) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  ggtitle("Top 10 trainers") +
+  xlab("Trainer") +
+  ylab("Number of wins")
+
+```
+
+```{r, include=TRUE, echo=FALSE, warning=FALSE, message=FALSE, fig.align="center", fig.height= 4, fig.width=7}
+### Distrbution of Odds ###
+j = ggplot(results, aes(x = winodds)) +
+  geom_histogram(fill = "darkred")
+
+### boxplot of odds ###
+y = results %>%
+  filter(as.numeric(plc) %in% c(1:14)) %>%
+  ggplot(aes(x = as.factor(plc), y = winodds)) +
+  geom_boxplot() +
+  scale_x_discrete(limits=c(1:14)) +
+  ggtitle("Winodds vs. horsno") +
+  xlab("Win odds") +
+  ylab("Favored to win")
+
+j + y
+```
+
+In Hong Kong decimal odds are used, which is the standard on most online betting sites. The number shows how much the total payout will be, including the original stake per unit staked. For example, a winning bet at 1.5 would return a total of 1.50 dollars for every 1 dollar staked, so the individual would of profited by 50 cents.    
+
+Starting with the graph on the left we see the win odds ranging from 1.2 to 99.0, and that most of the odds are on the lower end, with supprisingly a large count of odd of 99. On the right side, we again have the horseno with the win odds, what we can see is that the most favorable horse has the lowest odds. Which makes sense as the payout should be less where there is more certanity a particular horse will win. What is also noticable is that there are more outliers in the as you move to 14th place, which are instances where there has been an upset or an underdog has taken a top position.
+
+
+
+
+
+
+
+
+
+
+### Modeling 
+
+```{r}
+### Subsetting relevant data ###
+sub = results %>% dplyr::select(everything(), -lbw, -runningpos, date, -import_type,  -finishtime, -handicap, -raceno,
+                                -plc, -going, -stake,  -country, -sire, -dam, -pos_change, -winodds, -owner, -horseno) %>% 
+  na.omit() %>% 
+  group_by(jockey) %>%
+  filter(n() >1) %>%
+  ungroup() %>%
+  group_by(horse) %>%
+  filter(n() > 1)%>%
+  ungroup()
+
+### recasting data ###
+sub$draw = as.factor(sub$draw)
+#sub$raceno = as.factor(sub$raceno)
+sub$class = as.factor(sub$class)
+sub$distance = as.factor(sub$distance)
+sub$plc_top3 = as.factor(sub$plc_top3)
+#sub$horseno = as.factor(sub$horseno)
+sub$date = ymd(sub$date)
+
+### Removing Horse and Jockey That Only Have One Race ###
+sub = sub %>%
+  group_by(horse) %>%
+  mutate(
+    h = n()
+  ) %>% ungroup() %>%
+  group_by(jockey) %>%
+  mutate(
+    j = n()
+  ) %>% ungroup() 
+
+sub = sub %>% filter(h != 1) %>% filter( j > 1) 
+
+### Creating Train and Test ###
+train = sub %>%
+  group_by(horse) %>%
+  filter(date != max(date)) %>%
+  ungroup()
+
+test = sub %>%
+  group_by(horse) %>%
+  filter(date == max(date)) %>%
+  ungroup()
+
+train$date = NULL
+train$h = NULL
+train$j = NULL
+test$date = NULL
+test$h = NULL
+test$j = NULL
+sub$h = NULL
+sub$j = NULL
+sub$date = NULL
+
+### validate ###
+`%nin%` = Negate(`%in%`)
+
+unique(subset(test$jockey, !(test$jockey %in% train$jockey)))
+unique(subset(test$horse, !(test$horse %in% train$horse)))
+
+### Making Subsample ###
+#ss = sub[sample(nrow(sub), 7000),]
+
+#glm_upper = glm(plc_top3 ~ ., data = ss, family = "binomial")
+#glm_lower = glm(plc_top3 ~ 1, data = ss, family = "binomial")
+
+#glm_step = stepAIC(glm_lower,direction="both",scope=list(upper=glm_upper,lower=glm_lower))
+#plc_top3 ~ jockey + draw + declarwt
+
+### Machine Learning ###
+##########################################################################################################################################
+#ctrl <- trainControl(method = "none", allowParallel = TRUE)
+
+
+# ### GLM Model ###
+# cl <- makePSOCKcluster(7)
+# registerDoParallel(cl)
+# 
+# glm = train(
+#   form = plc_top3 ~ .,
+#   data = train,
+#   method = "glm",
+#   family = "binomial",
+#   control = list(maxit = 10000)
+# )
+# 
+# stopCluster(cl)
+# 
+# 
+# saveRDS(glm,'glm_saved')
+# glm <- readRDS('glm_saved')
+# 
+# 
+# ### GLM Step Model ###
+# cl <- makePSOCKcluster(7)
+# registerDoParallel(cl)
+# 
+# glm_step = train(
+#   form = plc_top3 ~ jockey + draw + declarwt,
+#   data = train,
+#   method = "glm",
+#   family = "binomial",
+#   control = list(maxit = 10000)
+# )
+# 
+# stopCluster(cl)
+# 
+# 
+# saveRDS(glm_step,'glm_step_saved')
+# glm_step <- readRDS('glm_step_saved')
+# 
+# 
+# 
+# 
+# 
+# 
+# ### Random Forest ###
+# control <- trainControl(method='repeatedcv', 
+#                         number=2, 
+#                         repeats=1,
+#                         search = 'random',
+#                         allowParallel = TRUE)
+# 
+# require(caret); library(doParallel); 
+# cl <- makePSOCKcluster(detectCores() -1); 
+# clusterEvalQ(cl, library(foreach)); registerDoParallel(cl)
+# 
+# rforest <- train(plc_top3 ~ ., data = train,
+#                method = "parRF",
+#                ntree = 100,
+#                trControl = control,
+#                tuneLength = 4)
+# 
+# stopCluster(cl)
+# 
+# 
+# saveRDS(rforest,'rforest_saved')
+# rforest <- readRDS('rforest_saved')
+#
+```
+
+
+
+### testing grounds
+```{r}
+train$jockey = NULL
+test$jockey = NULL
+
+
+### GLM Model ###
+cl <- makePSOCKcluster(7)
+registerDoParallel(cl)
+
+glm2 = train(
+  form = plc_top3 ~ .,
+  data = train,
+  method = "glm",
+  family = "binomial",
+  control = list(maxit = 10000)
+)
+
+stopCluster(cl)
+
+
+
+### GLM Step Model ###
+cl <- makePSOCKcluster(7)
+registerDoParallel(cl)
+
+glm_step2 = train(
+  form = plc_top3 ~ jockey + draw + declarwt,
+  data = train,
+  method = "glm",
+  family = "binomial",
+  control = list(maxit = 10000)
+)
+
+stopCluster(cl)
+
+
+
+
+
+
+### Random Forest ###
+control <- trainControl(method='repeatedcv',
+                        number=2,
+                        repeats=1,
+                        search = 'random',
+                        allowParallel = TRUE)
+
+require(caret); library(doParallel);
+cl <- makePSOCKcluster(detectCores() -1);
+clusterEvalQ(cl, library(foreach)); registerDoParallel(cl)
+
+rforest2 <- train(plc_top3 ~ ., data = train,
+               method = "parRF",
+               ntree = 100,
+               trControl = control,
+               tuneLength = 4)
+
+stopCluster(cl)
+
+
+saveRDS(rforest,'rforest_saved')
+rforest <- readRDS('rforest_saved')
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+### ROC for GLM ###
+invisible(roc(as.factor(train$plc_top3),fitted(glm),plot=T,print.thres="best",legacy.axes=T,
+              print.auc =T,col="red2"))
+# AUC of 0.846
+# Cut at 0.248
+
+### Confustion for GLM ###
+confusionMatrix(as.factor(ifelse(fitted(glm) >= 0.248, "1", "0")),
+                 as.factor(train$plc_top3), positive = "1")
+# Acc of 0.75
+# kappa of 0.44
+
+### Test for GLM ###
+confusionMatrix(as.factor(ifelse(predict(glm, newdata = test) == 1, "1", "0")),
+                 as.factor(test$plc_top3), positive = "1")
+# Acc of 0.76
+# kapa of 0.14
+
+
+
+
+
+
+### ROC for GLM Step ###
+invisible(roc(as.factor(train$plc_top3),fitted(glm_step),plot=T,print.thres="best",legacy.axes=T,
+              print.auc =T,col="red2"))
+# Acc of 0.676
+# Cut at 0.242
+
+### Confustion for GLM Step###
+confusionMatrix(as.factor(ifelse(fitted(glm_step) >= 0.242, "1", "0")),
+                 as.factor(train$plc_top3), positive = "1")
+# Acc of 0.75
+# kappa of 0.20
+
+### Test For glm Step ###
+confusionMatrix(as.factor(ifelse(predict(glm_step, newdata = test) == 1, "1", "0")),
+                 as.factor(test$plc_top3), positive = "1")
+# Acc of 0.79
+# kappa of 0.08
+
+
+
+
+
+### ROC for rforest ###
+roc(train$plc_top3, as.integer(fitted(rforest))-1, plot = T, print.thres="best",legacy.axes=T,
+              print.auc =T,col="red2")
+
+# AUC of 0.794
+# Cut at 0.50
+
+### Confustion for glm ###
+confusionMatrix(as.factor(ifelse(fitted(rforest) == 1, "1", "0")),
+                 as.factor(train$plc_top3), positive = "1")
+# Acc of 0.871
+# kappa of 0.6303
+
+### Test For glm ###
+confusionMatrix(as.factor(ifelse(predict(rforest, newdata = test) == 1, "1", "0")),
+                 as.factor(test$plc_top3), positive = "1")
+```
+
+
+```{r}
+```
+
+### Conclusion
+
+### Limitations
